@@ -12,7 +12,9 @@ class SimpleIcons < Formula
   depends_on "rust" => :build
 
   def install
-    virtualenv_install_with_resources
+    virtualenv_create(libexec, "python@3.12")
+    system libexec/"bin/pip", "install", "-v", "--ignore-installed", buildpath
+    bin.install_symlink libexec/"bin/simple-icons"
   end
 
   test do
