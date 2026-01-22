@@ -12,7 +12,9 @@ class SimpleIcons < Formula
   depends_on "uv" => :build
 
   def install
-    system "uv", "pip", "install", "--prefix", prefix, "--no-cache", "."
+    venv = virtualenv_create(libexec, "python3.12")
+    system "uv", "pip", "install", "--python", venv.python_executable, "."
+    bin.install_symlink libexec/"bin/simple-icons"
   end
 
   test do
