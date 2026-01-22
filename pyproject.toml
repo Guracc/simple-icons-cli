@@ -1,0 +1,22 @@
+[project]
+name = "simple-icons-cli"
+version = "0.1.0"
+description = "CLI for Simple Icons"
+readme = "README.md"
+authors = [
+    { name = "Guracc", email = "garaccioni.andrea@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cairosvg>=2.8.2",
+    "requests>=2.32.5",
+    "rich>=14.2.0",
+    "typer>=0.21.1",
+]
+
+[project.scripts]
+simple-icons = "simple_icons_cli.main:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
