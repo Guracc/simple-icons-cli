@@ -9,6 +9,7 @@ class SimpleIcons < Formula
 
   depends_on "cairo"
   depends_on "python@3.12"
+  depends_on "rust" => :build
 
   def install
     virtualenv_install_with_resources
