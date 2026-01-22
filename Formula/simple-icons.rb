@@ -12,9 +12,7 @@ class SimpleIcons < Formula
   depends_on "rust" => :build
 
   def install
-    venv = virtualenv_create(libexec, "python3.12")
-    system libexec/"bin/pip", "install", "requests", "rich", "typer", "cairosvg", "pillow", "prompt-toolkit", "rapidfuzz"
-    venv.pip_install_and_link buildpath
+    system "python3.12", "-m", "pip", "install", *std_pip_args, "."
   end
 
   test do
