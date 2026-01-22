@@ -2,6 +2,10 @@ import json
 import os
 import io
 import sys
+import ctypes
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 import requests
@@ -9,13 +13,25 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-# Try to import cairosvg safely
+# Attempt to load libcairo explicitly on macOS to fix Homebrew issues
+if sys.platform == "darwin":
+    cairo_lib = None
+    for lib_path in ["/opt/homebrew/lib/libcairo.2.dylib", "/usr/local/lib/libcairo.2.dylib"]:
+        if os.path.exists(lib_path):
+            try:
+                cairo_lib = ctypes.CDLL(lib_path)
+                break
+            except OSError:
+                pass
+    
+    # We just need to load it into the process space. 
+    # If successful, cairocffi (imported by cairosvg) should find it via dlopen.
+
 try:
     import cairosvg
 except (ImportError, OSError):
     cairosvg = None
 
-# Try to import PIL safely
 try:
     from PIL import Image
 except ImportError:
@@ -81,8 +97,8 @@ def download(
     slug: str = typer.Argument(..., help="Icon slug"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file or directory"),
     color: Optional[str] = typer.Option(None, "--color", "-c", help="Hex color (without #)"),
-    format: str = typer.Option("svg", "--format", "-f", help="Output format (svg, png, jpg, pdf)"),
-    size: int = typer.Option(256, "--size", "-s", help="Size in pixels (for raster formats)"),
+    format: str = typer.Option("svg", "--format", "-f", help="Output format (svg, png, jpg, pdf, ico, icns)"),
+    size: int = typer.Option(256, "--size", "-s", help="Size in pixels (for raster formats). Ignored for ICNS."),
 ):
     """Download an icon (and optionally convert it)."""
     url = f"{CDN_URL}/{slug}"
@@ -94,14 +110,13 @@ def download(
     # Infer format from output extension
     if output and not output.is_dir() and output.suffix:
         ext = output.suffix.lower().lstrip(".")
-        if ext in ["svg", "png", "jpg", "jpeg", "pdf"]:
+        if ext in ["svg", "png", "jpg", "jpeg", "pdf", "ico", "icns"]:
             format = ext.replace("jpeg", "jpg")
 
     if format != "svg" and (cairosvg is None or Image is None):
-        console.print("[red]Error: 'cairosvg' could not be loaded.[/red]")
+        console.print("[red]Error: 'cairosvg' and 'pillow' (and libcairo) are required for conversion.[/red]")
         if sys.platform == "darwin":
-             console.print("[yellow]Tip: If you installed cairo via Homebrew, try running:[/yellow]")
-             console.print("[bold]export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:$DYLD_FALLBACK_LIBRARY_PATH[/bold]")
+             console.print("[yellow]Tip: Install cairo with `brew install cairo`[/yellow]")
         raise typer.Exit(code=1)
 
     filename = f"{slug}.{format}"
@@ -142,6 +157,33 @@ def download(
                 else:
                     bg.paste(image)
                 bg.save(target, "JPEG")
+            elif format == "ico":
+                png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
+                image = Image.open(io.BytesIO(png_data))
+                image.save(target, format="ICO")
+            elif format == "icns":
+                if sys.platform != "darwin":
+                    console.print("[red]ICNS generation is currently only supported on macOS via iconutil.[/red]")
+                    raise typer.Exit(code=1)
+                
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    iconset_path = Path(temp_dir) / "icon.iconset"
+                    iconset_path.mkdir()
+                    
+                    # Standard ICNS sizes: 16, 32, 128, 256, 512.
+                    # iconutil expects specific filenames: icon_NxN.png and icon_NxN@2x.png
+                    sizes = [16, 32, 128, 256, 512]
+                    for s in sizes:
+                        # 1x
+                        png_data = cairosvg.svg2png(bytestring=svg_content, output_width=s, output_height=s)
+                        (iconset_path / f"icon_{s}x{s}.png").write_bytes(png_data)
+                        
+                        # 2x
+                        png_data_2x = cairosvg.svg2png(bytestring=svg_content, output_width=s*2, output_height=s*2)
+                        (iconset_path / f"icon_{s}x{s}@2x.png").write_bytes(png_data_2x)
+                    
+                    subprocess.run(["iconutil", "-c", "icns", str(iconset_path), "-o", str(target)], check=True)
+
             else:
                 console.print(f"[red]Unsupported format: {format}[/red]")
                 return
