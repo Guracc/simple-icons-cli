@@ -9,10 +9,10 @@ class SimpleIcons < Formula
 
   depends_on "cairo"
   depends_on "python@3.12"
-  depends_on "rust" => :build
+  depends_on "uv" => :build
 
   def install
-    system "python3.12", "-m", "pip", "install", *std_pip_args, "."
+    system "uv", "pip", "install", "--prefix", prefix, "--no-cache", "."
   end
 
   test do
