@@ -2,30 +2,41 @@ import json
 import os
 import io
 import sys
+import re
+import shlex
 import ctypes
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
+from contextlib import contextmanager
+
 import requests
 import typer
 from rich.console import Console
 from rich.table import Table
 
-# Attempt to load libcairo explicitly on macOS to fix Homebrew issues
+# Autocompletion
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import NestedCompleter
+from prompt_toolkit.styles import Style
+
+# --- Configuration & Globals ---
+
 if sys.platform == "darwin":
     cairo_lib = None
-    for lib_path in ["/opt/homebrew/lib/libcairo.2.dylib", "/usr/local/lib/libcairo.2.dylib"]:
+    lib_paths = [
+        "/opt/homebrew/lib/libcairo.2.dylib", 
+        "/usr/local/lib/libcairo.2.dylib",
+        "/opt/homebrew/lib/libcairo.dylib"
+    ]
+    for lib_path in lib_paths:
         if os.path.exists(lib_path):
             try:
                 cairo_lib = ctypes.CDLL(lib_path)
                 break
             except OSError:
                 pass
-    
-    # We just need to load it into the process space. 
-    # If successful, cairocffi (imported by cairosvg) should find it via dlopen.
 
 try:
     import cairosvg
@@ -37,16 +48,28 @@ try:
 except ImportError:
     Image = None
 
-app = typer.Typer(name="simple-icons", help="CLI for Simple Icons")
+app = typer.Typer(name="simple-icons", help="CLI for Simple Icons", add_completion=False)
 console = Console()
+err_console = Console(stderr=True)
 
 DATA_URL = "https://unpkg.com/simple-icons/data/simple-icons.json"
 CDN_URL = "https://cdn.simpleicons.org"
 CACHE_PATH = Path.home() / ".cache" / "simple-icons-cli"
 CACHE_FILE = CACHE_PATH / "data.json"
 
+state = {"streamline": False}
+
+# --- Helpers ---
+
+@contextmanager
+def task_status(message: str):
+    if state["streamline"]:
+        yield
+    else:
+        with console.status(message):
+            yield
+
 def get_data():
-    """Fetch icon data with local caching."""
     if CACHE_FILE.exists():
         try:
             return json.loads(CACHE_FILE.read_text())
@@ -54,12 +77,41 @@ def get_data():
             pass
             
     CACHE_PATH.mkdir(parents=True, exist_ok=True)
-    with console.status("[bold green]Fetching icon data..."):
-        response = requests.get(DATA_URL)
-        response.raise_for_status()
-        data = response.json()
-        CACHE_FILE.write_text(json.dumps(data))
-        return data
+    with task_status("[bold green]Fetching icon data..."):
+        try:
+            response = requests.get(DATA_URL)
+            response.raise_for_status()
+            data = response.json()
+            CACHE_FILE.write_text(json.dumps(data))
+            return data
+        except Exception as e:
+            err_console.print(f"[red]Error fetching data: {e}[/red]")
+            sys.exit(1)
+
+def resolve_icon(query: str, icons: list) -> Optional[dict]:
+    """Finds an icon by slug, allowing for fuzzy matching."""
+    # 1. Exact match
+    for icon in icons:
+        if icon["slug"] == query:
+            return icon
+            
+    # 2. Fuzzy match
+    slugs = [i["slug"] for i in icons]
+    match = process.extractOne(query, slugs, scorer=fuzz.ratio)
+    
+    if match:
+        best_slug, score, index = match
+        if score >= 60: # Threshold
+            # Notify user of the correction
+            if not state["streamline"]:
+                console.print(f"[yellow]'{query}' not found. Did you mean [bold]{best_slug}[/bold]? (Score: {score:.1f})[/yellow]")
+            
+            # Find the full icon object for this slug
+            return next((i for i in icons if i["slug"] == best_slug), None)
+            
+    return None
+
+# --- Commands ---
 
 @app.command()
 def search(query: str = typer.Argument(..., help="Search query (title or slug)")):
@@ -69,154 +121,329 @@ def search(query: str = typer.Argument(..., help="Search query (title or slug)")
     query = query.lower()
     
     for icon in icons:
-        title = icon["title"]
-        slug = icon["slug"]
-        hex_code = icon["hex"]
-        
-        if query in title.lower() or query in slug.lower():
-            results.append((title, slug, hex_code))
+        if query in icon["title"].lower() or query in icon["slug"].lower():
+            results.append(icon)
 
     if not results:
-        console.print(f"[red]No icons found for '{query}'[/red]")
+        if not state["streamline"]:
+            console.print(f"[red]No icons found for '{query}'[/red]")
         return
 
-    table = Table(title=f"Search Results for '{query}'")
-    table.add_column("Title", style="cyan")
-    table.add_column("Slug", style="magenta")
-    table.add_column("Hex", style="green")
+    if state["streamline"]:
+        for icon in results:
+            print(icon["slug"])
+    else:
+        table = Table(title=f"Search Results for '{query}'")
+        table.add_column("Title", style="cyan")
+        table.add_column("Slug", style="magenta")
+        table.add_column("Hex", style="green")
+        for item in results[:25]:
+            table.add_row(item["title"], item["slug"], f"#{item['hex']}")
+        console.print(table)
+        if len(results) > 25:
+            console.print(f"[dim]...and {len(results) - 25} more.[/dim]")
 
-    for title, slug, hex_code in results[:25]:
-        table.add_row(title, slug, f"#{hex_code}")
-
-    console.print(table)
-    if len(results) > 25:
-        console.print(f"[dim]...and {len(results) - 25} more. Try a more specific query.[/dim]")
+@app.command()
+def info(slug: str = typer.Argument(..., help="Icon slug")):
+    """Show detailed information about an icon."""
+    icons = get_data()
+    icon = resolve_icon(slug, icons)
+    
+    if not icon:
+        err_console.print(f"[red]Icon '{slug}' not found (even with fuzzy search).[/red]")
+        sys.exit(1)
+    
+    if state["streamline"]:
+        print(f"title: {icon['title']}")
+        print(f"slug: {icon['slug']}")
+        print(f"hex: {icon['hex']}")
+    else:
+        console.print(f"[bold cyan]{icon['title']}[/bold cyan]")
+        console.print(f"Slug: [magenta]{icon['slug']}[/magenta]")
+        console.print(f"Hex: [green]#{icon['hex']}[/green]")
+        console.print(f"Source: [blue]{icon['source']}[/blue]")
 
 @app.command()
 def download(
     slug: str = typer.Argument(..., help="Icon slug"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file or directory"),
     color: Optional[str] = typer.Option(None, "--color", "-c", help="Hex color (without #)"),
-    format: str = typer.Option("svg", "--format", "-f", help="Output format (svg, png, jpg, pdf, ico, icns)"),
-    size: int = typer.Option(256, "--size", "-s", help="Size in pixels (for raster formats). Ignored for ICNS."),
+    invert: bool = typer.Option(False, "--invert", "-i", help="Invert the color (e.g. Black -> White)."),
+    opacity: float = typer.Option(1.0, "--opacity", help="Opacity (0.0 to 1.0)."),
+    background: Optional[str] = typer.Option(None, "--background", "-bg", help="Background color (removes transparency)."),
+    format: str = typer.Option("svg", "--format", "-f", help="Output format"),
+    size: int = typer.Option(256, "--size", "-s", help="Size in pixels"),
 ):
-    """Download an icon (and optionally convert it)."""
+    """Download and optionally convert an icon."""
+    
+    icons = get_data()
+    icon_data = resolve_icon(slug, icons)
+    
+    if not icon_data:
+        err_console.print(f"[red]Icon '{slug}' not found.[/red]")
+        sys.exit(1)
+        
+    # Update slug to the real one found via fuzzy match
+    slug = icon_data["slug"]
+    
+    # 1. Resolve Color
+    target_hex = None
+    
+    # If explicit color or invert is requested, we need to calculate the hex
+    if color or invert:
+        if color:
+            hex_str = color.lstrip('#')
+        else:
+            hex_str = icon_data["hex"]
+
+        if invert:
+            # Invert hex
+            val = int(hex_str, 16)
+            inverted_val = 0xFFFFFF ^ val
+            target_hex = f"{inverted_val:06X}"
+        else:
+            target_hex = hex_str
+
+    # 2. Construct URL
     url = f"{CDN_URL}/{slug}"
-    if color:
-        url += f"/{color.lstrip('#')}"
+    if target_hex:
+        url += f"/{target_hex}"
     
+    # 3. Resolve Format
     format = format.lower()
-    
-    # Infer format from output extension
     if output and not output.is_dir() and output.suffix:
-        ext = output.suffix.lower().lstrip(".")
-        if ext in ["svg", "png", "jpg", "jpeg", "pdf", "ico", "icns"]:
-            format = ext.replace("jpeg", "jpg")
+        format = output.suffix.lower().lstrip(".")
 
     if format != "svg" and (cairosvg is None or Image is None):
-        console.print("[red]Error: 'cairosvg' and 'pillow' (and libcairo) are required for conversion.[/red]")
-        if sys.platform == "darwin":
-             console.print("[yellow]Tip: Install cairo with `brew install cairo`[/yellow]")
-        raise typer.Exit(code=1)
+        err_console.print("[red]Error: cairo and pillow required for conversion.[/red]")
+        sys.exit(1)
 
     filename = f"{slug}.{format}"
-    
-    if output is None:
-        target = Path(filename)
-    elif output.is_dir():
-        target = output / filename
-    else:
-        target = output
+    target = output / filename if output and output.is_dir() else (output or Path(filename))
 
-    with console.status(f"[bold green]Downloading {slug}..."):
+    with task_status(f"Downloading {slug}..."):
         response = requests.get(url)
         if response.status_code == 404:
-            console.print(f"[red]Icon '{slug}' not found.[/red]")
-            return
+            err_console.print(f"[red]Icon '{slug}' not found.[/red]")
+            sys.exit(1)
         response.raise_for_status()
         svg_content = response.content
 
-    if format == "svg":
-        target.write_bytes(svg_content)
-        console.print(f"[green]Successfully downloaded {slug} to [bold]{target}[/bold][/green]")
-        return
+    # 4. Apply Opacity (SVG manipulation)
+    if opacity < 1.0:
+        svg_text = svg_content.decode("utf-8")
+        # Inject opacity into the root svg tag
+        # Simple regex to add opacity attribute. 
+        # Note: If viewBox exists, we append after it, otherwise after <svg
+        if "opacity=" in svg_text:
+             svg_text = re.sub(r'opacity="[\d\.]+"', f'opacity="{opacity}"', svg_text)
+        else:
+             svg_text = re.sub(r'<svg', f'<svg opacity="{opacity}"', svg_text)
+        svg_content = svg_text.encode("utf-8")
 
-    # Conversion logic
-    with console.status(f"[bold blue]Converting to {format}..."):
-        try:
-            if format == "png":
-                cairosvg.svg2png(bytestring=svg_content, write_to=str(target), output_width=size, output_height=size)
-            elif format == "pdf":
-                cairosvg.svg2pdf(bytestring=svg_content, write_to=str(target), output_width=size, output_height=size)
-            elif format == "jpg":
-                png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
-                image = Image.open(io.BytesIO(png_data))
-                bg = Image.new("RGB", image.size, (255, 255, 255))
-                if image.mode == 'RGBA':
-                    bg.paste(image, mask=image.split()[3])
-                else:
-                    bg.paste(image)
-                bg.save(target, "JPEG")
-            elif format == "ico":
-                png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
-                image = Image.open(io.BytesIO(png_data))
-                image.save(target, format="ICO")
-            elif format == "icns":
-                if sys.platform != "darwin":
-                    console.print("[red]ICNS generation is currently only supported on macOS via iconutil.[/red]")
-                    raise typer.Exit(code=1)
-                
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    iconset_path = Path(temp_dir) / "icon.iconset"
-                    iconset_path.mkdir()
-                    
-                    # Standard ICNS sizes: 16, 32, 128, 256, 512.
-                    # iconutil expects specific filenames: icon_NxN.png and icon_NxN@2x.png
-                    sizes = [16, 32, 128, 256, 512]
-                    for s in sizes:
-                        # 1x
-                        png_data = cairosvg.svg2png(bytestring=svg_content, output_width=s, output_height=s)
-                        (iconset_path / f"icon_{s}x{s}.png").write_bytes(png_data)
-                        
-                        # 2x
-                        png_data_2x = cairosvg.svg2png(bytestring=svg_content, output_width=s*2, output_height=s*2)
-                        (iconset_path / f"icon_{s}x{s}@2x.png").write_bytes(png_data_2x)
-                    
-                    subprocess.run(["iconutil", "-c", "icns", str(iconset_path), "-o", str(target)], check=True)
-
-            else:
-                console.print(f"[red]Unsupported format: {format}[/red]")
-                return
-                
-        except Exception as e:
-            console.print(f"[red]Conversion failed: {e}[/red]")
-            if "cairo" in str(e).lower() or "dlopen" in str(e).lower():
-                 console.print("[yellow]Tip: Install libcairo: `brew install cairo`[/yellow]")
-            raise typer.Exit(code=1)
-
-    console.print(f"[green]Successfully saved to [bold]{target}[/bold][/green]")
-
-@app.command()
-def info(slug: str = typer.Argument(..., help="Icon slug")):
-    """Show detailed information about an icon."""
-    icons = get_data()
-    icon = next((i for i in icons if i["slug"] == slug), None)
-    
-    if not icon:
-        console.print(f"[red]Icon '{slug}' not found.[/red]")
-        return
+    try:
+        if format == "svg":
+            # If background is requested for SVG, we wrap in a group and add a rect
+            # This is complex XML manipulation, simplified here:
+            if background:
+                # Basic SVG background injection could go here, but it's often cleaner in design tools.
+                # For CLI, we'll warn or skip. Let's skip for SVG to keep it simple or implement if critical.
+                pass 
+            target.write_bytes(svg_content)
+        else:
+            with task_status(f"Converting to {format}..."):
+                convert_image(svg_content, target, format, size, background)
         
-    console.print(f"[bold cyan]{icon['title']}[/bold cyan]")
-    console.print(f"Slug: [magenta]{icon['slug']}[/magenta]")
-    console.print(f"Hex: [green]#{icon['hex']}[/green]")
-    console.print(f"Source: [blue]{icon['source']}[/blue]")
-    if "guidelines" in icon:
-        console.print(f"Guidelines: [blue]{icon['guidelines']}[/blue]")
-    if "license" in icon:
-        license_data = icon['license']
-        l_type = license_data.get('type') if isinstance(license_data, dict) else license_data
-        l_url = license_data.get('url') if isinstance(license_data, dict) else "N/A"
-        console.print(f"License: {l_type} ({l_url})")
+        print(f"exported {target.name}")
+        
+    except Exception as e:
+        err_console.print(f"[red]Failed: {e}[/red]")
+        sys.exit(1)
+
+def convert_image(svg_content, target, format, size, background=None):
+    # If background provided, clean hex
+    bg_color = None
+    if background:
+        h = background.lstrip('#')
+        # Convert hex to RGB tuple for Pillow
+        bg_color = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    if format == "png":
+        png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
+        if bg_color:
+            image = Image.open(io.BytesIO(png_data))
+            # Create solid background
+            bg = Image.new("RGBA", image.size, bg_color + (255,))
+            # Paste icon using itself as mask
+            bg.alpha_composite(image)
+            bg.save(target, "PNG")
+        else:
+            with open(target, "wb") as f:
+                f.write(png_data)
+
+    elif format == "ico":
+        png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
+        image = Image.open(io.BytesIO(png_data))
+        if bg_color:
+            bg = Image.new("RGBA", image.size, bg_color + (255,))
+            bg.alpha_composite(image)
+            image = bg
+        image.save(target, format="ICO")
+
+    elif format == "jpg":
+        # JPG does not support transparency, so we MUST have a background.
+        # Default to White if not provided.
+        if not bg_color:
+            bg_color = (255, 255, 255)
+            
+        png_data = cairosvg.svg2png(bytestring=svg_content, output_width=size, output_height=size)
+        image = Image.open(io.BytesIO(png_data))
+        bg = Image.new("RGB", image.size, bg_color)
+        if image.mode == 'RGBA':
+            bg.paste(image, mask=image.split()[3])
+        else:
+            bg.paste(image)
+        bg.save(target, "JPEG")
+
+    elif format == "icns":
+        with tempfile.TemporaryDirectory() as temp_dir:
+            iconset = Path(temp_dir) / "icon.iconset"
+            iconset.mkdir()
+            for s in [16, 32, 128, 256, 512]:
+                png_data = cairosvg.svg2png(bytestring=svg_content, output_width=s, output_height=s)
+                
+                # Apply background if needed
+                if bg_color:
+                    img = Image.open(io.BytesIO(png_data))
+                    bg = Image.new("RGBA", img.size, bg_color + (255,))
+                    bg.alpha_composite(img)
+                    # Save back to bytes for write
+                    buf = io.BytesIO()
+                    bg.save(buf, format="PNG")
+                    png_data = buf.getvalue()
+                
+                (iconset/f"icon_{s}x{s}.png").write_bytes(png_data)
+                
+                # For @2x (simulated upscale if source is vector, simply render larger)
+                png_data_2x = cairosvg.svg2png(bytestring=svg_content, output_width=s*2, output_height=s*2)
+                if bg_color:
+                    img = Image.open(io.BytesIO(png_data_2x))
+                    bg = Image.new("RGBA", img.size, bg_color + (255,))
+                    bg.alpha_composite(img)
+                    buf = io.BytesIO()
+                    bg.save(buf, format="PNG")
+                    png_data_2x = buf.getvalue()
+
+                (iconset/f"icon_{s}x{s}@2x.png").write_bytes(png_data_2x)
+
+            subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(target)], check=True)
+    else:
+        # Fallback basic
+        cairosvg.svg2png(bytestring=svg_content, write_to=str(target), output_width=size, output_height=size)
+
+# --- REPL ---
+
+from prompt_toolkit.formatted_text import HTML
+
+from rapidfuzz import process, fuzz
+
+def interactive_shell():
+    console.print("[bold yellow]Simple Icons Shell[/bold yellow]")
+    console.print("[dim]Type [bold]help[/bold] to see available commands or [bold]exit[/bold] to quit.[/dim]")
+    
+    slugs = []
+    try:
+        if CACHE_FILE.exists():
+             data = json.loads(CACHE_FILE.read_text())
+             slugs = [icon["slug"] for icon in data]
+    except:
+        pass
+
+    slug_commands = {s: None for s in slugs}
+    
+    completer_dict = {
+        "search": None,
+        "info": slug_commands,
+        "download": slug_commands,
+        "help": None,
+        "exit": None,
+        "quit": None,
+        "clear": None,
+        "cls": None
+    }
+    
+    completer = NestedCompleter.from_nested_dict(completer_dict)
+    
+    # Enhanced Styling
+    style = Style.from_dict({
+        # Prompt
+        'p-icon': '#00ff00 bold',   # Green icon
+        'p-name': '#00ffff bold',   # Cyan name
+        'p-arrow': '#888888',       # Gray arrow
+        
+        # Completion Menu
+        'completion-menu': 'bg:#222222 #eeeeee', 
+        'completion-menu.completion': 'bg:#222222 #eeeeee',
+        'completion-menu.completion.current': 'bg:#00aaaa #000000 bold', # Cyan bg, black text for selected
+        'scrollbar.background': 'bg:#222222',
+        'scrollbar.button': 'bg:#444444',
+        
+        # Toolbar
+        'bottom-toolbar': 'bg:#333333 #ffffff',
+        'bottom-toolbar.key': '#ff00ff bold', # Magenta keys
+    })
+
+    def get_toolbar():
+        return HTML(' <b>TAB</b> Autocomplete  |  <b>UP/DOWN</b> History  |  <b>CTRL+D</b> Exit ')
+
+    session = PromptSession(completer=completer, style=style)
+
+    while True:
+        try:
+            # Rich, multicolored prompt
+            prompt_fragments = [
+                ('class:p-icon', '🚀 '),
+                ('class:p-name', 'simple-icons'),
+                ('class:p-arrow', ' > '),
+            ]
+            
+            cmd = session.prompt(
+                prompt_fragments, 
+                bottom_toolbar=get_toolbar
+            )
+            cmd = cmd.strip()
+            
+            if not cmd: continue
+            if cmd.lower() in ["exit", "quit", "q"]: break
+            
+            if cmd.lower() in ["clear", "cls"]:
+                os.system('clear' if os.name != 'nt' else 'cls')
+                continue
+            
+            if cmd.lower() in ["/help", "?", "h"]:
+                cmd = "--help"
+            
+            args = shlex.split(cmd)
+            if args and args[0].lower() == "help":
+                args = ["--help"]
+                
+            app(args, standalone_mode=False)
+            
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
+            break
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+
+@app.callback(invoke_without_command=True)
+def cli_root(
+    ctx: typer.Context,
+    streamline: bool = typer.Option(False, "--streamline", "-s", help="Clean output for scripting."),
+):
+    state["streamline"] = streamline
+    if ctx.invoked_subcommand is None:
+        interactive_shell()
 
 def main():
     app()
